@@ -1865,6 +1865,15 @@ _EXEC_POLICY_BACKOFF_BASE_S = 300      # first retry 5 min after a failure
 _EXEC_POLICY_BACKOFF_MAX_S = 3600     # never back off longer than an hour
 _EXEC_POLICY_BACKOFF = {"fails": 0, "until": 0.0}
 
+# Native approvals are live Gateway state. Keep the CLI poll bounded and
+# cache the result so the 2-second policy watcher does not create a request
+# storm on machines with a slow Node wrapper.
+_NATIVE_APPROVAL_POLL_INTERVAL_S = 3.0
+_native_approval_poll_at = 0.0
+_native_approval_poll_lock = threading.Lock()
+_native_approval_poll_thread: Optional[threading.Thread] = None
+_native_approval_poll_result: Optional[tuple[bool, dict | list | None, str]] = None
+
 
 def _openclaw_env_and_bin():
     """Resolve the `openclaw` binary with an augmented PATH (the daemon runs
@@ -1876,6 +1885,143 @@ def _openclaw_env_and_bin():
     env = os.environ.copy()
     env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "")
     return shutil.which("openclaw", path=env["PATH"]), env
+
+
+def _run_openclaw_approval_command(args: list[str]) -> tuple[bool, dict | list | None, str]:
+    """Run a native approval CLI command without letting it escape the watcher."""
+    import subprocess
+
+    ocbin, env = _openclaw_env_and_bin()
+    if not ocbin:
+        return False, None, "openclaw binary not found"
+    try:
+        result = subprocess.run(
+            [ocbin, *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return False, None, "openclaw command timed out"
+    except Exception as exc:
+        return False, None, str(exc)
+    if result.returncode != 0:
+        return False, None, (result.stderr or result.stdout or "command failed")[-500:]
+    if "--json" not in args:
+        return True, None, ""
+    try:
+        return True, json.loads(result.stdout or "{}"), ""
+    except (TypeError, ValueError) as exc:
+        return False, None, f"invalid JSON: {exc}"
+
+
+def _native_approval_cli_worker() -> None:
+    global _native_approval_poll_result
+    result = _run_openclaw_approval_command(
+        ["approvals", "pending", "--json"]
+    )
+    with _native_approval_poll_lock:
+        _native_approval_poll_result = result
+
+
+def poll_openclaw_approvals() -> int:
+    """Import OpenClaw's live pending approvals into the local queue.
+
+    Native approvals are deliberately marked in ``args`` so the dashboard's
+    existing decision endpoint can route them back to OpenClaw. A CLI failure
+    is observational only and never blocks the watcher.
+    """
+    global _native_approval_poll_at, _native_approval_poll_thread
+    now = time.time()
+    global _native_approval_poll_result
+    with _native_approval_poll_lock:
+        if (_native_approval_poll_thread is not None
+                and _native_approval_poll_thread.is_alive()):
+            return 0
+        result = _native_approval_poll_result
+        _native_approval_poll_result = None
+        if _native_approval_poll_thread is not None:
+            _native_approval_poll_thread = None
+        if result is None and now - _native_approval_poll_at >= _NATIVE_APPROVAL_POLL_INTERVAL_S:
+            _native_approval_poll_at = now
+            _native_approval_poll_thread = threading.Thread(
+                target=_native_approval_cli_worker,
+                name="clawmetry-openclaw-approvals",
+                daemon=True,
+            )
+            _native_approval_poll_thread.start()
+            return 0
+    ok, payload, error = result
+    if not ok:
+        log.debug("openclaw native approval poll skipped: %s", error)
+        return 0
+    entries = payload.get("approvals", []) if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        log.warning("openclaw approvals pending returned no approvals list")
+        return 0
+    try:
+        from clawmetry import local_store
+        store = local_store.get_store()
+    except Exception as exc:
+        log.debug("openclaw native approval store unavailable: %s", exc)
+        return 0
+
+    pending_ids = set()
+    rows = store.query_approvals(limit=1000)
+    rows_by_id = {row.get("id"): row for row in rows}
+    imported = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        approval_id = str(entry.get("rawId") or entry.get("id") or "").strip()
+        if not approval_id:
+            continue
+        pending_ids.add(approval_id)
+        existing = rows_by_id.get(approval_id)
+        if existing is not None and existing.get("status") != "pending":
+            continue
+        session_id = entry.get("sessionId") or entry.get("session_id")
+        created_ms = entry.get("createdAtMs") or entry.get("created_at_ms")
+        created_at = (str(created_ms) if created_ms is not None else
+                  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        store.ingest_approval({
+            "id": approval_id,
+            "requestor_session_id": f"openclaw:{session_id}" if session_id else None,
+            "action": entry.get("summary") or entry.get("tool") or "OpenClaw approval",
+            "args": {
+                "source": "openclaw-native",
+                "native": entry,
+            },
+            "status": "pending",
+            "created_at": created_at,
+        }, preserve_resolved=True)
+        imported += 1
+    for row in rows:
+        args = row.get("args") if isinstance(row.get("args"), dict) else {}
+        if (args.get("source") == "openclaw-native"
+                and row.get("id") not in pending_ids):
+            store.update_approval_decision(
+                row["id"], "expired", "openclaw-sync",
+                "no longer pending in OpenClaw",
+            )
+    return imported
+
+
+def resolve_openclaw_approval(approval_id: str, decision: str,
+                              reason: str | None = None) -> bool:
+    """Resolve one native OpenClaw approval through its documented CLI."""
+    action = {"approve": "allow-once", "deny": "deny"}.get(
+        str(decision or "").strip().lower())
+    if action is None:
+        return False
+    args = ["approvals", "resolve", str(approval_id), action]
+    if action == "deny" and reason:
+        args.extend(["--reason", str(reason)[:300]])
+    ok, _payload, error = _run_openclaw_approval_command(args)
+    if not ok:
+        log.warning("openclaw approval %s failed to resolve: %s", approval_id, error)
+    return ok
 
 
 def _policies_want_exec_gate(policies) -> bool:
@@ -2161,6 +2307,12 @@ def watcher_loop(api_key: str, node_id: str,
             return
         try:
             policies = load_policies(api_key=api_key)
+            try:
+                imported = poll_openclaw_approvals()
+                if imported:
+                    log.debug("approvals: imported %d native OpenClaw approvals", imported)
+            except Exception as _na:
+                log.debug("native OpenClaw approval poll skipped: %s", _na)
             # Drive every runtime's native pre-execution gate from the same
             # policy set (the reactive watcher below can't PREVENT a command,
             # only catch it after the fact). openclaw's exec preset flip and
