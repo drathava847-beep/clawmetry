@@ -276,6 +276,7 @@ CLAWMETRY_REVIEW_SAMPLE_MAX=200        # Review queue: per-agent cap in percent 
 # Guard / enforcement. Every one of these defaults to the safe side.
 CLAWMETRY_DETECTORS=1                  # Trajectory + behavioural detectors on/off
 CLAWMETRY_GUARD_POLICIES=1             # Evaluate Guard policies at all (0 = skip the pass entirely)
+CLAWMETRY_NATIVE_APPROVALS=1           # Import OpenClaw's own pending approvals (0 = never shell out to `openclaw approvals`; auto-skipped when openclaw isn't installed)
 CLAWMETRY_DESKTOP_ALERTS=1             # Urgent incidents (critical, or an agent blocked on you) pop a desktop notification (0 = off)
 CLAWMETRY_CLOUD_INCIDENT_ALERTS=1      # Connected nodes hand urgent incidents to cloud, which always emails the account owner (0 = off)
 CLAWMETRY_POLICY_ENFORCE=0             # Let a policy actually signal a process. Default 0 = dry run; this one env var disables every policy on the node

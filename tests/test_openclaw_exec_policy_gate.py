@@ -314,6 +314,8 @@ def test_native_poll_runs_cli_off_watcher_thread(monkeypatch):
         return True, {"approvals": []}, ""
 
     monkeypatch.setattr(approvals, "_run_openclaw_approval_command", _slow_command)
+    monkeypatch.setattr(approvals, "_openclaw_env_and_bin",
+                        lambda: ("/usr/local/bin/openclaw", {}))
     monkeypatch.setattr(approvals, "_native_approval_poll_at", 0.0)
     monkeypatch.setattr(approvals, "_native_approval_poll_thread", None)
     monkeypatch.setattr(approvals, "_native_approval_poll_result", None)
@@ -640,3 +642,50 @@ def test_native_remember_always_maps_to_allow_always(monkeypatch):
         ["approvals", "resolve", "a3", "allow-once"],
         ["approvals", "resolve", "a4", "deny", "--reason", "no"],
     ]
+
+
+def test_native_poll_skipped_without_openclaw(monkeypatch):
+    """The approvals watcher runs on every daemon. Most nodes run some other
+    runtime, and there the poll must cost a `which`, not a node process."""
+    spawned = []
+    monkeypatch.setattr(approvals, "_native_approval_poll_thread", None)
+    monkeypatch.setattr(approvals, "_native_approval_poll_result", None)
+    monkeypatch.setattr(approvals, "_native_approval_poll_at", 0.0)
+    monkeypatch.setattr(approvals, "_NATIVE_APPROVAL_BACKOFF",
+                        {"fails": 0, "until": 0.0})
+    monkeypatch.setattr(approvals.threading, "Thread",
+                        lambda **kw: spawned.append(kw) or _NeverThread())
+
+    monkeypatch.setattr(approvals, "_openclaw_env_and_bin", lambda: (None, {}))
+    assert approvals.poll_openclaw_approvals() == 0
+    assert spawned == []
+
+    monkeypatch.setattr(approvals, "_openclaw_env_and_bin",
+                        lambda: ("/usr/local/bin/openclaw", {}))
+    assert approvals.poll_openclaw_approvals() == 0
+    assert len(spawned) == 1          # present -> it does poll
+
+
+def test_native_poll_env_kill_switch(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(approvals, "_native_approval_poll_thread", None)
+    monkeypatch.setattr(approvals, "_native_approval_poll_result", None)
+    monkeypatch.setattr(approvals, "_native_approval_poll_at", 0.0)
+    monkeypatch.setattr(approvals, "_NATIVE_APPROVAL_BACKOFF",
+                        {"fails": 0, "until": 0.0})
+    monkeypatch.setattr(approvals, "_openclaw_env_and_bin",
+                        lambda: ("/usr/local/bin/openclaw", {}))
+    monkeypatch.setattr(approvals.threading, "Thread",
+                        lambda **kw: spawned.append(kw) or _NeverThread())
+
+    monkeypatch.setenv("CLAWMETRY_NATIVE_APPROVALS", "0")
+    assert approvals.poll_openclaw_approvals() == 0
+    assert spawned == []
+
+
+class _NeverThread:
+    def is_alive(self):
+        return False
+
+    def start(self):
+        pass

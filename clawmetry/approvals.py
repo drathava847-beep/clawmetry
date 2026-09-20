@@ -1868,7 +1868,15 @@ _EXEC_POLICY_BACKOFF = {"fails": 0, "until": 0.0}
 # Native approvals are live Gateway state. Keep the CLI poll bounded and
 # cache the result so the kick-driven policy watcher does not create a
 # request storm on machines with a slow Node wrapper.
-_NATIVE_APPROVAL_POLL_INTERVAL_S = 3.0
+#
+# The watcher thread starts on EVERY daemon, so whatever this interval is,
+# it is a permanent background cost on every user's machine: one `openclaw`
+# process (a node wrapper) per tick, forever, whether or not anyone ever
+# opens the Approvals tab. 10 s is the cheapest interval that costs a human
+# nothing — these prompts are read and decided by a person, so seconds of
+# discovery latency are imperceptible, while 3 s would spawn 20 node
+# processes a minute against a perfectly healthy gateway.
+_NATIVE_APPROVAL_POLL_INTERVAL_S = 10.0
 _NATIVE_APPROVAL_TIMEOUT_S = 30
 # The watcher is kicked on every tool_call, so "gateway down" would otherwise
 # mean one `openclaw` (node) spawn every 3 s, forever. Same reasoning as
@@ -1894,6 +1902,20 @@ def _openclaw_env_and_bin():
     env = os.environ.copy()
     env["PATH"] = ":".join(extra) + ":" + env.get("PATH", "")
     return shutil.which("openclaw", path=env["PATH"]), env
+
+
+def _native_approvals_enabled() -> bool:
+    """Whether to poll OpenClaw for native approvals on this node at all.
+
+    Off by env switch, and skipped outright when there is no `openclaw`
+    here — most nodes run some other runtime, and resolving the binary
+    costs a few stat calls where spawning the CLI to find out costs a node
+    process every tick."""
+    if os.environ.get("CLAWMETRY_NATIVE_APPROVALS", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return False
+    ocbin, _ = _openclaw_env_and_bin()
+    return bool(ocbin)
 
 
 def _run_openclaw_approval_command(args: list[str]) -> tuple[bool, dict | list | None, str]:
@@ -1976,7 +1998,8 @@ def poll_openclaw_approvals() -> int:
             # elapsed and we are not backing off a failing gateway; either
             # way this iteration has no snapshot to reconcile against.
             if (now - _native_approval_poll_at >= _NATIVE_APPROVAL_POLL_INTERVAL_S
-                    and now >= _NATIVE_APPROVAL_BACKOFF["until"]):
+                    and now >= _NATIVE_APPROVAL_BACKOFF["until"]
+                    and _native_approvals_enabled()):
                 _native_approval_poll_at = now
                 _native_approval_poll_thread = threading.Thread(
                     target=_native_approval_cli_worker,
