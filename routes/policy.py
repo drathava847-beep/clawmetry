@@ -766,7 +766,8 @@ def api_approval_decide(approval_id: str):
         if decision == "answer":
             return jsonify({"ok": False,
                             "error": "OpenClaw native approvals do not support answers"}), 400
-        if not _approvals.resolve_openclaw_approval(aid, decision, reason):
+        if not _approvals.resolve_openclaw_approval(aid, decision, reason,
+                                                    remember=remember):
             return jsonify({"ok": False,
                             "error": "OpenClaw could not resolve this approval"}), 502
 

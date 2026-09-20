@@ -43,6 +43,22 @@ def audit(monkeypatch, tmp_path):
     return A
 
 
+def _stub_local_store(monkeypatch, fake_ls):
+    """Make ``from clawmetry import local_store`` resolve to ``fake_ls``.
+
+    Patching sys.modules alone is not enough: once the real submodule has
+    been imported by ANY earlier test, ``clawmetry.local_store`` is an
+    attribute on the package and ``from clawmetry import local_store``
+    reads that attribute instead of the sys.modules entry. These producers
+    then talk to the real ~/.clawmetry DuckDB, ``update_approval_decision``
+    returns 0 for an id that is not there, and the audit row never gets
+    written -- an order-dependent failure that looks like a hollow pipe.
+    """
+    import clawmetry
+    monkeypatch.setitem(sys.modules, "clawmetry.local_store", fake_ls)
+    monkeypatch.setattr(clawmetry, "local_store", fake_ls, raising=False)
+
+
 def _types(audit):
     return {t["event_type"] for t in audit.event_types()}
 
@@ -146,7 +162,7 @@ def test_process_tool_call_records_decision(audit, monkeypatch):
             update_approval_decision=lambda *a, **k: None,
         )
     )
-    monkeypatch.setitem(sys.modules, "clawmetry.local_store", fake_ls)
+    _stub_local_store(monkeypatch, fake_ls)
 
     # Use a ``cm_``-prefixed key so the local-blocking branch added in
     # 2026-07-15 stays off — this test guards the CLOUD dispatch path
@@ -175,7 +191,7 @@ def test_apply_approval_decision_records_audit(audit, monkeypatch):
     fake_store = types.SimpleNamespace(
         update_approval_decision=lambda *a, **k: 1)
     fake_ls = types.SimpleNamespace(get_store=lambda: fake_store)
-    monkeypatch.setitem(sys.modules, "clawmetry.local_store", fake_ls)
+    _stub_local_store(monkeypatch, fake_ls)
 
     sync._apply_approval_decision({
         "type": "approval_decision", "id": "appr-1",
@@ -194,7 +210,7 @@ def test_apply_approval_decision_noop_does_not_audit(audit, monkeypatch):
     fake_store = types.SimpleNamespace(
         update_approval_decision=lambda *a, **k: 0)
     fake_ls = types.SimpleNamespace(get_store=lambda: fake_store)
-    monkeypatch.setitem(sys.modules, "clawmetry.local_store", fake_ls)
+    _stub_local_store(monkeypatch, fake_ls)
 
     sync._apply_approval_decision({
         "type": "approval_decision", "id": "appr-2", "decision": "approved",

@@ -9,9 +9,11 @@ hand-set posture is never clobbered. No-op off an OpenClaw host.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -227,15 +229,45 @@ def test_native_approval_resolve_maps_decisions(monkeypatch):
     ]
 
 
-def test_native_cli_nonzero_exit_is_fail_open(monkeypatch):
-    class Failed:
-        returncode = 2
-        stdout = ""
-        stderr = "gateway unavailable"
+class _FakeProc:
+    """Minimal Popen stand-in: `communicate` either returns or times out."""
 
-    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: Failed())
+    def __init__(self, returncode=0, stdout="", stderr="", timeout=False):
+        self.pid = 4242
+        self.returncode = returncode
+        self._out, self._err = stdout, stderr
+        self._timeout = timeout
+        self.killed_group = False
+        self.killed_proc = False
+
+    def communicate(self, timeout=None):
+        if self._timeout:
+            raise subprocess.TimeoutExpired("openclaw", timeout)
+        return self._out, self._err
+
+    def kill(self):
+        self.killed_proc = True
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _patch_cli(monkeypatch, proc):
     monkeypatch.setattr(approvals, "_openclaw_env_and_bin",
                         lambda: ("/usr/local/bin/openclaw", {}))
+    seen = {}
+
+    def _popen(cmd, **kwargs):
+        seen["cmd"], seen["kwargs"] = cmd, kwargs
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    return seen
+
+
+def test_native_cli_nonzero_exit_is_fail_open(monkeypatch):
+    proc = _FakeProc(returncode=2, stderr="gateway unavailable")
+    _patch_cli(monkeypatch, proc)
 
     ok, payload, error = approvals._run_openclaw_approval_command(
         ["approvals", "pending", "--json"])
@@ -243,18 +275,33 @@ def test_native_cli_nonzero_exit_is_fail_open(monkeypatch):
     assert "gateway unavailable" in error
 
 
-def test_native_cli_timeout_is_fail_open(monkeypatch):
-    def _timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
-
-    monkeypatch.setattr(subprocess, "run", _timeout)
-    monkeypatch.setattr(approvals, "_openclaw_env_and_bin",
-                        lambda: ("/usr/local/bin/openclaw", {}))
+def test_native_cli_timeout_kills_the_process_group(monkeypatch):
+    """`openclaw` is a wrapper; killing only the wrapper leaves its node
+    child running. A poll that runs every few seconds cannot leak one of
+    those per timeout, so the CLI gets its own session and the GROUP is
+    killed (same reason _apply_openclaw_exec_preset does it)."""
+    proc = _FakeProc(timeout=True)
+    seen = _patch_cli(monkeypatch, proc)
+    killed = []
+    monkeypatch.setattr(approvals.os, "killpg",
+                        lambda pid, sig: killed.append((pid, sig)))
 
     ok, payload, error = approvals._run_openclaw_approval_command(
         ["approvals", "pending", "--json"])
     assert (ok, payload) == (False, None)
     assert error == "openclaw command timed out"
+    assert seen["kwargs"].get("start_new_session") is True
+    assert killed == [(proc.pid, signal.SIGKILL)]
+
+
+def test_native_cli_parses_documented_payload(monkeypatch):
+    """`openclaw approvals pending --json` emits {"approvals": [...]} at the
+    top level (docs/cli/approvals.md)."""
+    _patch_cli(monkeypatch, _FakeProc(stdout='{"approvals": [{"id": "x"}]}'))
+    ok, payload, error = approvals._run_openclaw_approval_command(
+        ["approvals", "pending", "--json"])
+    assert (ok, error) == (True, "")
+    assert payload == {"approvals": [{"id": "x"}]}
 
 
 def test_native_poll_runs_cli_off_watcher_thread(monkeypatch):
@@ -341,6 +388,23 @@ def test_watcher_loop_integrates_native_poll(monkeypatch):
     assert calls == ["poll", "watch"]
 
 
+def _patch_native_resolver(monkeypatch, verdict):
+    """Stub resolve_openclaw_approval on the LIVE approvals module.
+
+    routes/policy.py imports it late (`from clawmetry import approvals`), so
+    it resolves whatever sits in sys.modules at request time. Several test
+    files importlib.reload() this module, after which the name bound at the
+    top of THIS file is a dead object and patching it lets the route shell
+    out to the real `openclaw` CLI. Returns the call log."""
+    import sys as _sys
+    live = _sys.modules["clawmetry.approvals"]
+    calls = []
+    monkeypatch.setattr(
+        live, "resolve_openclaw_approval",
+        lambda *args, **kwargs: (calls.append((args, kwargs)), verdict)[1])
+    return calls
+
+
 def test_native_route_does_not_update_local_status_when_resolve_fails(monkeypatch):
     from flask import Flask
     import routes.local_query as local_query
@@ -360,8 +424,7 @@ def test_native_route_does_not_update_local_status_when_resolve_fails(monkeypatc
     updates = []
     monkeypatch.setattr(local_query, "local_store_via_daemon",
                         lambda method, **kwargs: updates.append((method, kwargs)))
-    monkeypatch.setattr(approvals, "resolve_openclaw_approval",
-                        lambda *args, **kwargs: False)
+    resolved = _patch_native_resolver(monkeypatch, False)
 
     app = Flask(__name__)
     app.register_blueprint(policy.bp_policy)
@@ -369,6 +432,9 @@ def test_native_route_does_not_update_local_status_when_resolve_fails(monkeypatc
         "/api/approvals/native-1/decide", json={"decision": "approve"})
     assert response.status_code == 502
     assert updates == []
+    # Without this the test passes for the wrong reason: an unpatched
+    # resolver shells out to the real `openclaw` and also returns False.
+    assert len(resolved) == 1
 
 
 def test_native_route_updates_local_status_after_resolve(monkeypatch):
@@ -390,8 +456,7 @@ def test_native_route_updates_local_status_after_resolve(monkeypatch):
     updates = []
     monkeypatch.setattr(local_query, "local_store_via_daemon",
                         lambda method, **kwargs: updates.append((method, kwargs)) or 1)
-    monkeypatch.setattr(approvals, "resolve_openclaw_approval",
-                        lambda *args, **kwargs: True)
+    resolved = _patch_native_resolver(monkeypatch, True)
 
     app = Flask(__name__)
     app.register_blueprint(policy.bp_policy)
@@ -404,3 +469,174 @@ def test_native_route_updates_local_status_after_resolve(monkeypatch):
         "approval_id": "native-2", "decision": "deny",
         "resolver": "local", "reason": "not expected",
     })]
+    assert len(resolved) == 1
+
+
+# ── the real `openclaw approvals pending --json` entry shape ──────────────
+# Taken from readPendingApprovalEntry in the shipped CLI bundle and from
+# docs/cli/approvals.md: normalized entries under "approvals", each
+# {id, kind, agentId, sessionKey, createdAtMs, expiresAtMs, summary}.
+# There is no sessionId and no rawId in that payload.
+_REAL_ENTRY = {
+    "id": "exec_01HV9ZZ",
+    "kind": "exec",
+    "agentId": "main",
+    "sessionKey": "sess-abc123",
+    "createdAtMs": 1758300000000,
+    "expiresAtMs": 1758300300000,
+    "summary": "rm -rf /tmp/build",
+}
+
+
+class _RecordingStore:
+    def __init__(self, rows=None):
+        self.rows = rows or []
+        self.ingested = []
+        self.decisions = []
+
+    def query_approvals(self, **kwargs):
+        rows = self.rows
+        if kwargs.get("status"):
+            rows = [r for r in rows if r.get("status") == kwargs["status"]]
+        return rows
+
+    def ingest_approval(self, row, preserve_resolved=False):
+        self.ingested.append((row, preserve_resolved))
+
+    def update_approval_decision(self, *args):
+        self.decisions.append(args)
+
+
+def _arm_poll(monkeypatch, store, payload):
+    import clawmetry.local_store as local_store
+    monkeypatch.setattr(local_store, "get_store", lambda: store)
+    monkeypatch.setattr(approvals, "_native_approval_poll_thread", None)
+    monkeypatch.setattr(approvals, "_native_approval_poll_result", payload)
+    monkeypatch.setattr(approvals, "_native_approval_poll_at", 0.0)
+    monkeypatch.setattr(approvals, "_NATIVE_APPROVAL_BACKOFF",
+                        {"fails": 0, "until": 0.0})
+
+
+def test_native_poll_reads_the_fields_openclaw_actually_emits(monkeypatch):
+    """OpenClaw names the session `sessionKey`. Reading `sessionId` left
+    requestor_session_id NULL, which is the column the Approvals tab scopes
+    and attributes every row by."""
+    store = _RecordingStore()
+    _arm_poll(monkeypatch, store, (True, {"approvals": [_REAL_ENTRY]}, ""))
+
+    assert approvals.poll_openclaw_approvals() == 1
+    row, preserve = store.ingested[0]
+    assert preserve is True
+    assert row["requestor_session_id"] == "openclaw:sess-abc123"
+    assert row["action"] == "rm -rf /tmp/build"
+    assert row["args"]["agent_id"] == "main"
+    assert row["args"]["expires_at_ms"] == 1758300300000
+    # The runtime stopped to ask; it was not a ClawMetry policy firing.
+    assert row["args"]["kind"] == "permission_prompt"
+    assert row["args"]["runtime"] == "openclaw"
+    # routes/policy.py::_arg_preview reads `command` — without it the card
+    # previews the raw native blob instead of the command being approved.
+    assert row["args"]["command"] == "rm -rf /tmp/build"
+    assert row["args"]["native"] == _REAL_ENTRY
+
+
+def test_native_poll_stores_created_at_as_iso(monkeypatch):
+    """createdAtMs is epoch milliseconds; the approvals table holds ISO-8601
+    and /api/approvals hands created_at to the UI verbatim."""
+    store = _RecordingStore()
+    _arm_poll(monkeypatch, store, (True, {"approvals": [_REAL_ENTRY]}, ""))
+    approvals.poll_openclaw_approvals()
+
+    created = store.ingested[0][0]["created_at"]
+    assert created.endswith("Z") and created[4] == "-" and created[10] == "T"
+    from datetime import datetime
+    datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ")  # parses, or raises
+
+
+def test_native_poll_survives_a_kick_inside_the_poll_window(monkeypatch):
+    """watcher_loop is kick-driven (every tool_call), so it re-enters well
+    inside _NATIVE_APPROVAL_POLL_INTERVAL_S with no result waiting."""
+    store = _RecordingStore()
+    _arm_poll(monkeypatch, store, (True, {"approvals": []}, ""))
+    assert approvals.poll_openclaw_approvals() == 0      # consumes the result
+    monkeypatch.setattr(approvals, "_native_approval_poll_at", time.time())
+    assert approvals.poll_openclaw_approvals() == 0      # must not raise
+
+
+def test_native_poll_backs_off_a_failing_gateway(monkeypatch):
+    """Gateway-down is ordinary on a box where OpenClaw is installed but not
+    running. Without a backoff the kick-driven watcher spawns one node
+    process every few seconds, forever."""
+    spawned = []
+    monkeypatch.setattr(approvals, "_native_approval_poll_thread", None)
+    monkeypatch.setattr(approvals, "_native_approval_poll_at", 0.0)
+    monkeypatch.setattr(approvals, "_NATIVE_APPROVAL_BACKOFF",
+                        {"fails": 0, "until": 0.0})
+    monkeypatch.setattr(
+        approvals, "_native_approval_poll_result",
+        (False, None, "Gateway not reachable at ws://127.0.0.1:18789"))
+
+    class _Thread:
+        def __init__(self, **kwargs):
+            spawned.append(kwargs.get("name"))
+
+        def is_alive(self):
+            return False
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(approvals.threading, "Thread", _Thread)
+
+    assert approvals.poll_openclaw_approvals() == 0
+    assert approvals._NATIVE_APPROVAL_BACKOFF["until"] > time.time()
+    monkeypatch.setattr(approvals, "_native_approval_poll_result", None)
+    monkeypatch.setattr(approvals, "_native_approval_poll_at", 0.0)
+    assert approvals.poll_openclaw_approvals() == 0
+    assert spawned == []          # backed off: no new CLI process
+
+
+def test_native_poll_sweep_only_touches_pending_native_rows(monkeypatch):
+    """A row decided here stays decided; only a still-pending native row
+    that OpenClaw has stopped listing is expired."""
+    store = _RecordingStore(rows=[
+        {"id": "decided", "status": "approved",
+         "args": {"source": "openclaw-native"}},
+        {"id": "stale", "status": "pending",
+         "args": {"source": "openclaw-native"}},
+        {"id": "ours", "status": "pending",
+         "args": {"source": "pretooluse-hook"}},
+    ])
+    _arm_poll(monkeypatch, store,
+              (True, {"approvals": [{"id": "decided", "summary": "x"},
+                                    {"id": "new", "summary": "y"}]}, ""))
+
+    assert approvals.poll_openclaw_approvals() == 1
+    assert [r["id"] for r, _ in store.ingested] == ["new"]
+    assert store.decisions == [
+        ("stale", "expired", "openclaw-sync", "no longer pending in OpenClaw")
+    ]
+
+
+def test_native_remember_always_maps_to_allow_always(monkeypatch):
+    """"Approve & always allow" must reach OpenClaw as allow-always, or the
+    remembered rule exists only on our side and OpenClaw asks again."""
+    calls = []
+    monkeypatch.setattr(
+        approvals, "_run_openclaw_approval_command",
+        lambda args: (calls.append(args), (True, None, ""))[1],
+    )
+
+    assert approvals.resolve_openclaw_approval("a1", "approve") is True
+    assert approvals.resolve_openclaw_approval(
+        "a2", "approve", remember="always") is True
+    assert approvals.resolve_openclaw_approval(
+        "a3", "approve", remember="session") is True
+    assert approvals.resolve_openclaw_approval(
+        "a4", "deny", "no", remember="always") is True
+    assert calls == [
+        ["approvals", "resolve", "a1", "allow-once"],
+        ["approvals", "resolve", "a2", "allow-always"],
+        ["approvals", "resolve", "a3", "allow-once"],
+        ["approvals", "resolve", "a4", "deny", "--reason", "no"],
+    ]
