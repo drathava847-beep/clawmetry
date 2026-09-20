@@ -1582,7 +1582,24 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install from source
-        run: pip install flask .
+        # `flask` used to be named here as a bare argument, alongside `.`.
+        # It is an unconstrained direct requirement: pip resolves whatever
+        # the index serves for it at job start, in a required check that
+        # runs on every PR. It is also redundant -- setup.py already
+        # declares `flask>=2.0,<4` in install_requires, so `.` installs
+        # flask under that constraint on its own.
+        #
+        # Redundant AND actively harmful to what this job measures: naming
+        # flask separately means the job keeps passing even if flask is
+        # ever dropped from install_requires, because the bare argument
+        # would still drag it in. That is the exact packaging regression
+        # this smoke test exists to catch. Installing `.` alone is what a
+        # user runs, so it is what the gate should assert.
+        #
+        # `.` stays unpinned on purpose: it is this repo's working tree,
+        # the code under test. Same boundary the hash-pinned sets draw
+        # elsewhere in this file.
+        run: pip install .
       # These used to be continue-on-error with a `|| echo` fallback, which
       # means they could never fail. The 5-week silent-Windows-CLI regression
       # (#3791) sailed through them: exit code 0, zero bytes of output. The
