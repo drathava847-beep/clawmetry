@@ -9193,13 +9193,16 @@ class LocalStore(AgentMetaMixin, ProjectsMixin, TrailStoreMixin):
             out.append(dict(zip(cols, r)))
         return out
 
-    def ingest_approval(self, approval: dict[str, Any]) -> None:
+    def ingest_approval(self, approval: dict[str, Any],
+                         preserve_resolved: bool = False) -> None:
         """Upsert one approval-queue row. Required: ``id``.
 
         Optional: ``owner_hash``, ``requestor_session_id``, ``action``,
         ``args`` (dict / list / str / bytes — coerced to BLOB via
         ``_to_blob``), ``status`` (default ``"pending"``), ``created_at``,
         ``resolved_at``, ``resolver``, ``decision``, ``decision_reason``.
+        ``preserve_resolved=True`` keeps an existing resolved row resolved
+        when a repeated ingest supplies a pending request.
 
         Re-ingesting the same id updates non-NULL fields and bumps the
         status; pre-existing decision metadata is preserved when the new
@@ -9223,7 +9226,11 @@ class LocalStore(AgentMetaMixin, ProjectsMixin, TrailStoreMixin):
                     requestor_session_id = COALESCE(excluded.requestor_session_id, approvals.requestor_session_id),
                     action               = COALESCE(excluded.action, approvals.action),
                     args                 = COALESCE(excluded.args, approvals.args),
-                    status               = excluded.status,
+                    status               = CASE
+                        WHEN ? AND approvals.status <> 'pending'
+                        THEN approvals.status
+                        ELSE excluded.status
+                    END,
                     created_at           = COALESCE(approvals.created_at, excluded.created_at),
                     resolved_at          = COALESCE(excluded.resolved_at, approvals.resolved_at),
                     resolver             = COALESCE(excluded.resolver, approvals.resolver),
@@ -9241,6 +9248,7 @@ class LocalStore(AgentMetaMixin, ProjectsMixin, TrailStoreMixin):
                 approval.get("resolver"),
                 approval.get("decision"),
                 approval.get("decision_reason"),
+                bool(preserve_resolved),
             ])
 
     def update_approval_decision(

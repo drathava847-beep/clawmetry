@@ -760,6 +760,16 @@ def api_approval_decide(approval_id: str):
         # the same "first click wins" the store method enforces.
         return jsonify({"ok": True, "status": existing, "already": True})
 
+    native_args = row.get("args") if isinstance(row.get("args"), dict) else {}
+    if native_args.get("source") == "openclaw-native":
+        from clawmetry import approvals as _approvals
+        if decision == "answer":
+            return jsonify({"ok": False,
+                            "error": "OpenClaw native approvals do not support answers"}), 400
+        if not _approvals.resolve_openclaw_approval(aid, decision, reason):
+            return jsonify({"ok": False,
+                            "error": "OpenClaw could not resolve this approval"}), 502
+
     # ── question-set answers (WO-52 phase 1) ─────────────────────────────
     # decision='answer' carries a structured ``answers`` map validated
     # against the question set stored in the row's args (unknown question
